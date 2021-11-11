@@ -75,10 +75,10 @@ public class JdbcSinkTask extends SinkTask {
     }
     final SinkRecord first = records.iterator().next();
     final int recordsCount = records.size();
-    log.debug(
-        "Received {} records. First record kafka coordinates:({}-{}-{}). Writing them to the "
-        + "database...",
-        recordsCount, first.topic(), first.kafkaPartition(), first.kafkaOffset()
+    log.info(
+            "Received {} records. First record kafka coordinates:({}-{}-{}), key-value: ({}-{}). Writing them to the "
+                    + "database...",
+            recordsCount, first.topic(), first.kafkaPartition(), first.kafkaOffset(), first.key(), first.value()
     );
     try {
       writer.write(records);

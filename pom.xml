@@ -69,6 +69,11 @@
 
     <repositories>
         <repository>
+            <id>Central</id>
+            <name>Central Repository</name>
+            <url>https://repo1.maven.org/maven2/</url>
+        </repository>
+        <repository>
             <id>confluent</id>
             <name>Confluent</name>
             <url>http://packages.confluent.io/maven/</url>
@@ -76,6 +81,17 @@
     </repositories>
 
     <dependencies>
+        <dependency>
+            <groupId>net.snowflake</groupId>
+            <artifactId>snowflake-jdbc</artifactId>
+            <version>3.13.8</version>
+            <scope>compile</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>connect-transforms</artifactId>
+            <version>${kafka.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>connect-api</artifactId>

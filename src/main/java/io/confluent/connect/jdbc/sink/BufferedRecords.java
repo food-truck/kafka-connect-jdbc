@@ -16,8 +16,10 @@
 package io.confluent.connect.jdbc.sink;
 
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.transforms.util.Requirements;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,8 +60,10 @@ public class BufferedRecords {
   private RecordValidator recordValidator;
   private FieldsMetadata fieldsMetadata;
   private PreparedStatement updatePreparedStatement;
+  private PreparedStatement insertPreparedStatement;
   private PreparedStatement deletePreparedStatement;
   private StatementBinder updateStatementBinder;
+  private StatementBinder insertStatementBinder;
   private StatementBinder deleteStatementBinder;
   private boolean deletesInBatch = false;
 
@@ -104,7 +108,13 @@ public class BufferedRecords {
       valueSchema = record.valueSchema();
       schemaChanged = true;
     }
-    if (schemaChanged || updateStatementBinder == null) {
+
+    Struct recordValue = Requirements.requireStruct(record.value(), "Read record to set topic routing for CREATE / UPDATE");
+    String op = recordValue.getString(JdbcSinkConfig.OPERATION_FIELD);
+
+    if (schemaChanged ||
+            ((op.equals(JdbcSinkConfig.OPERATION_INSERT) || op.equals(JdbcSinkConfig.OPERATION_SNAPSHOT)) && insertStatementBinder == null)
+            || ((op.equals(JdbcSinkConfig.OPERATION_UPDATE) || op.equals(JdbcSinkConfig.OPERATION_DELETE)) && updateStatementBinder == null)) {
       // Each batch needs to have the same schemas, so get the buffered records out
       flushed.addAll(flush());
 
@@ -126,7 +136,7 @@ public class BufferedRecords {
           tableId,
           fieldsMetadata
       );
-      final String insertSql = getInsertSql();
+      final String insertSql = getInsertSql(op);
       final String deleteSql = getDeleteSql();
       log.debug(
           "{} sql: {} deleteSql: {} meta: {}",
@@ -135,7 +145,30 @@ public class BufferedRecords {
           deleteSql,
           fieldsMetadata
       );
-      close();
+      close(op);
+
+      if (op.equals(JdbcSinkConfig.OPERATION_INSERT) || op.equals(JdbcSinkConfig.OPERATION_SNAPSHOT)) {
+        insertPreparedStatement = dbDialect.createPreparedStatement(connection, insertSql);
+        insertStatementBinder = dbDialect.statementBinder(
+                insertPreparedStatement,
+                config.pkMode,
+                schemaPair,
+                fieldsMetadata,
+                dbStructure.tableDefinition(connection, tableId),
+                config.insertMode
+        );
+      } else {
+        updatePreparedStatement = dbDialect.createPreparedStatement(connection, insertSql);
+        updateStatementBinder = dbDialect.statementBinder(
+                updatePreparedStatement,
+                config.pkMode,
+                schemaPair,
+                fieldsMetadata,
+                dbStructure.tableDefinition(connection, tableId),
+                config.insertMode
+        );
+      }
+
       updatePreparedStatement = dbDialect.createPreparedStatement(connection, insertSql);
       updateStatementBinder = dbDialect.statementBinder(
           updatePreparedStatement,
@@ -181,15 +214,22 @@ public class BufferedRecords {
       if (isNull(record.value()) && nonNull(deleteStatementBinder)) {
         deleteStatementBinder.bindRecord(record);
       } else {
-        updateStatementBinder.bindRecord(record);
+        Struct recordValue = Requirements.requireStruct(record.value(), "Read record to set topic routing for CREATE / UPDATE");
+        String op = recordValue.getString(JdbcSinkConfig.OPERATION_FIELD);
+        if (op.equals(JdbcSinkConfig.OPERATION_INSERT) || op.equals(JdbcSinkConfig.OPERATION_SNAPSHOT)) {
+          insertStatementBinder.bindRecord(record);
+        } else {
+          updateStatementBinder.bindRecord(record);
+        }
       }
     }
     Optional<Long> totalUpdateCount = executeUpdates();
+    Optional<Long> totalInsertCount = executeInserts();
     long totalDeleteCount = executeDeletes();
 
     final long expectedCount = updateRecordCount();
-    log.trace("{} records:{} resulting in totalUpdateCount:{} totalDeleteCount:{}",
-        config.insertMode, records.size(), totalUpdateCount, totalDeleteCount
+    log.trace("{} records:{} resulting in totalInsertCount:{} totalUpdateCount:{} totalDeleteCount:{}",
+            config.insertMode, records.size(), totalInsertCount, totalUpdateCount, totalDeleteCount
     );
     if (totalUpdateCount.filter(total -> total != expectedCount).isPresent()
         && config.insertMode == INSERT) {
@@ -199,12 +239,12 @@ public class BufferedRecords {
           expectedCount
       ));
     }
-    if (!totalUpdateCount.isPresent()) {
-      log.info(
-          "{} records:{} , but no count of the number of rows it affected is available",
-          config.insertMode,
-          records.size()
-      );
+    if (totalUpdateCount.isPresent()) {
+      if (totalUpdateCount.get() + totalInsertCount.orElse(0L) != updateRecordCount()) {
+        log.info("{} records:{} , but no count of the number of rows it affected is available",
+                config.insertMode,
+                records.size());
+      }
     }
 
     final List<SinkRecord> flushedRecords = records;
@@ -216,13 +256,32 @@ public class BufferedRecords {
   /**
    * @return an optional count of all updated rows or an empty optional if no info is available
    */
+  private Optional<Long> executeInserts() throws SQLException {
+    Optional<Long> count = Optional.empty();
+    if (nonNull(insertPreparedStatement)) {
+      for (int updateCount : insertPreparedStatement.executeBatch()) {
+        if (updateCount != Statement.SUCCESS_NO_INFO) {
+          count = count.isPresent()
+                  ? count.map(total -> total + updateCount)
+                  : Optional.of((long) updateCount);
+        }
+      }
+    }
+    return count;
+  }
+
+  /**
+   * @return an optional count of all updated rows or an empty optional if no info is available
+   */
   private Optional<Long> executeUpdates() throws SQLException {
     Optional<Long> count = Optional.empty();
-    for (int updateCount : updatePreparedStatement.executeBatch()) {
-      if (updateCount != Statement.SUCCESS_NO_INFO) {
-        count = count.isPresent()
-            ? count.map(total -> total + updateCount)
-            : Optional.of((long) updateCount);
+    if (nonNull(updatePreparedStatement)) {
+      for (int updateCount : updatePreparedStatement.executeBatch()) {
+        if (updateCount != Statement.SUCCESS_NO_INFO) {
+          count = count.isPresent()
+                  ? count.map(total -> total + updateCount)
+                  : Optional.of((long) updateCount);
+        }
       }
     }
     return count;
@@ -248,6 +307,24 @@ public class BufferedRecords {
         .count();
   }
 
+  public void close(String op) throws SQLException {
+    log.debug(
+            "Closing BufferedRecords[{}] with insertPreparedStatement: {}, updatePreparedStatement: {} deletePreparedStatement: {}",
+            op,
+            insertPreparedStatement,
+            updatePreparedStatement,
+            deletePreparedStatement
+    );
+    if (op.equals(JdbcSinkConfig.OPERATION_UPDATE) || op.equals(JdbcSinkConfig.OPERATION_DELETE)) {
+      updatePreparedStatement.close();
+      updatePreparedStatement = null;
+    }
+    if (op.equals(JdbcSinkConfig.OPERATION_INSERT) || op.equals(JdbcSinkConfig.OPERATION_SNAPSHOT)) {
+      insertPreparedStatement.close();
+      insertPreparedStatement = null;
+    }
+  }
+
   public void close() throws SQLException {
     log.debug(
         "Closing BufferedRecords with updatePreparedStatement: {} deletePreparedStatement: {}",
@@ -264,7 +341,7 @@ public class BufferedRecords {
     }
   }
 
-  private String getInsertSql() throws SQLException {
+  private String getInsertSql(String op) throws SQLException {
     switch (config.insertMode) {
       case INSERT:
         return dbDialect.buildInsertStatement(
@@ -282,11 +359,21 @@ public class BufferedRecords {
           ));
         }
         try {
-          return dbDialect.buildUpsertQueryStatement(
-              tableId,
-              asColumns(fieldsMetadata.keyFieldNames),
-              asColumns(fieldsMetadata.nonKeyFieldNames),
-              dbStructure.tableDefinition(connection, tableId)
+
+          if (op.equals(JdbcSinkConfig.OPERATION_INSERT) || op.equals(JdbcSinkConfig.OPERATION_SNAPSHOT)) {
+            return dbDialect.buildInsertStatement(
+                    tableId,
+                    asColumns(fieldsMetadata.keyFieldNames),
+                    asColumns(fieldsMetadata.nonKeyFieldNames),
+                    dbStructure.tableDefinition(connection, tableId)
+            );
+          }
+
+          return dbDialect.buildUpdateStatement(
+                  tableId,
+                  asColumns(fieldsMetadata.keyFieldNames),
+                  asColumns(fieldsMetadata.nonKeyFieldNames),
+                  dbStructure.tableDefinition(connection, tableId)
           );
         } catch (UnsupportedOperationException e) {
           throw new ConnectException(String.format(

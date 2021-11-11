@@ -1826,7 +1826,7 @@ public class GenericDatabaseDialect implements DatabaseDialect {
     builder.append(" ");
     String sqlType = getSqlType(f);
     builder.append(sqlType);
-    if (f.defaultValue() != null) {
+    if (f.defaultValue() != null && !sqlType.equals("TIMESTAMP_NTZ")) {
       builder.append(" DEFAULT ");
       formatColumnValue(
           builder,

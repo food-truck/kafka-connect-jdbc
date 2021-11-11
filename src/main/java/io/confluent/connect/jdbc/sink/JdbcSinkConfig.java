@@ -45,6 +45,12 @@ import org.apache.kafka.common.config.types.Password;
 
 public class JdbcSinkConfig extends AbstractConfig {
 
+  public static final String OPERATION_SNAPSHOT = "r";
+  public static final String OPERATION_INSERT = "c";
+  public static final String OPERATION_UPDATE = "u";
+  public static final String OPERATION_DELETE = "d";
+  public static final String OPERATION_FIELD = "__op";
+
   public enum InsertMode {
     INSERT,
     UPSERT,

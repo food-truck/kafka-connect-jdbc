@@ -16,6 +16,7 @@
 package io.confluent.connect.jdbc.sink;
 
 import io.confluent.connect.jdbc.util.ColumnDefinition;
+import io.confluent.connect.jdbc.util.DateTimeUtils;
 import io.confluent.connect.jdbc.util.TableDefinition;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
@@ -25,11 +26,13 @@ import org.apache.kafka.connect.sink.SinkRecord;
 
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.TimeZone;
 
 import io.confluent.connect.jdbc.dialect.DatabaseDialect;
 import io.confluent.connect.jdbc.dialect.DatabaseDialect.StatementBinder;
 import io.confluent.connect.jdbc.sink.metadata.FieldsMetadata;
 import io.confluent.connect.jdbc.sink.metadata.SchemaPair;
+import org.apache.kafka.connect.transforms.util.Requirements;
 
 import static java.util.Objects.isNull;
 
@@ -99,10 +102,16 @@ public class PreparedStatementBinder implements StatementBinder {
       switch (insertMode) {
         case INSERT:
         case UPSERT:
-          index = bindKeyFields(record, index);
-          bindNonKeyFields(record, valueStruct, index);
-          break;
+          Struct recordValue = Requirements.requireStruct(record.value(), "Read record to set topic routing for CREATE / UPDATE");
+          String op = recordValue.getString(JdbcSinkConfig.OPERATION_FIELD);
 
+          if (op.equals(JdbcSinkConfig.OPERATION_INSERT) || op.equals(JdbcSinkConfig.OPERATION_SNAPSHOT)) {
+            index = bindKeyFields(record, index);
+            bindNonKeyFields(record, valueStruct, index);
+          } else {
+            index = bindNonKeyFields(record, valueStruct, index);
+            bindKeyFields(record, index);
+          }
         case UPDATE:
           index = bindNonKeyFields(record, valueStruct, index);
           bindKeyFields(record, index);
@@ -182,6 +191,13 @@ public class PreparedStatementBinder implements StatementBinder {
 
   protected void bindField(int index, Schema schema, Object value, String fieldName)
       throws SQLException {
+    if (fieldName.equals("__ts_ms")) {
+      statement.setTimestamp(
+              index,
+              new java.sql.Timestamp((long) value),
+              DateTimeUtils.getTimeZoneCalendar(TimeZone.getDefault()));
+      return;
+    }
     ColumnDefinition colDef = tabDef == null ? null : tabDef.definitionForColumn(fieldName);
     dialect.bindField(statement, index, schema, value, colDef);
   }
